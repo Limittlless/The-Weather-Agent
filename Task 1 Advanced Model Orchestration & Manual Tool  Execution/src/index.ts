@@ -2,6 +2,7 @@ import "dotenv/config";
 import { z } from "zod";
 import { tool } from "@langchain/core/tools";
 import { ChatOllama } from "@langchain/ollama";
+import { ChatPromptTemplate, MessagesPlaceholder } from "@langchain/core/prompts";
 import { HumanMessage, ToolMessage, BaseMessage } from "@langchain/core/messages";
 
 const cityWeatherData: Record<string, { temperature: number; condition: string }> = {
@@ -40,11 +41,17 @@ const model = new ChatOllama({
   temperature: 0,
 });
 
+const weatherPrompt = ChatPromptTemplate.fromMessages([
+  ["system", "You are a precise weather assistant. Use the fetchWeather tool whenever a question depends on current conditions in a specific city, and give clear, concise answers."],
+  new MessagesPlaceholder("messages"),
+]);
+
 async function askAboutWeather(question: string) {
   const modelWithTools = model.bindTools([fetchWeather]);
-  const messages: BaseMessage[] = [new HumanMessage(question)];
+  const chain = weatherPrompt.pipe(modelWithTools);
 
-  const response = await modelWithTools.invoke(messages);
+  const messages: BaseMessage[] = [new HumanMessage(question)];
+  const response = await chain.invoke({ messages });
   messages.push(response);
 
   if (!response.tool_calls?.length) {
@@ -52,13 +59,18 @@ async function askAboutWeather(question: string) {
     return;
   }
 
-  for (const call of response.tool_calls) {
-    console.log(`[System] Caught LLM request to run tool ${call.name}.`);
-    const result = await fetchWeather.invoke(call.args as { city: string });
-    messages.push(new ToolMessage({ content: result, tool_call_id: call.id! }));
-  }
+  const toolMessages = await Promise.all(
+    response.tool_calls.map(async (call) => {
+      console.log(`[System] Caught LLM request to run tool ${call.name}.`);
+      const validatedArgs = fetchWeather.schema.parse(call.args);
+      const result = await fetchWeather.invoke(validatedArgs);
+      return new ToolMessage({ content: result, tool_call_id: call.id! });
+    })
+  );
 
-  const stream = await model.stream(messages);
+  messages.push(...toolMessages);
+
+  const stream = await chain.stream({ messages });
   for await (const chunk of stream) {
     process.stdout.write(String(chunk.content));
   }
